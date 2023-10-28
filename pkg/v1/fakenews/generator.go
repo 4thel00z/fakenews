@@ -4,79 +4,93 @@ import (
 	"bufio"
 	"io"
 	"math/rand"
+	"sync"
 )
 
-type Generator interface {
-	Next() (interface{}, bool)
-	Iter() Generator
+type Generator[T any] interface {
+	Next() (T, bool)
+	Iter() Generator[T]
 }
 
-func GeneratorFromIO(file io.ReadSeeker, parser LineParser) Generator {
-	return LineGenerator{
+func GeneratorFromIO[T any](file io.ReadSeeker, parser LineParser[T]) Generator[T] {
+	return LineGenerator[T]{
 		file:   file,
 		parser: parser,
+		mx:     &sync.Mutex{},
+		reader: bufio.NewReader(file),
 	}
 }
 
-// Crucial note: LineGenerator is NOT threadsafe !
-type LineGenerator struct {
+type LineGenerator[T any] struct {
 	file   io.ReadSeeker
-	parser LineParser
+	parser LineParser[T]
+	reader *bufio.Reader
+	mx     *sync.Mutex
 }
 
-func (l LineGenerator) Next() (interface{}, bool) {
-	line, _, err := bufio.NewReader(l.file).ReadLine()
+func (l LineGenerator[T]) Next() (T, bool) {
+	l.mx.Lock()
+	defer l.mx.Unlock()
+
+	var t T
+	if l.reader == nil {
+		l.reader = bufio.NewReader(l.file)
+	}
+	line, _, err := l.reader.ReadLine()
 	if err != nil {
-		return "", false
+		return t, false
 	}
 
-	if l.parser != nil {
-		return l.parser(line), true
+	if l.parser == nil {
+		return t, false
 	}
 
-	return line, true
+	return l.parser(line), true
 }
 
-func (l LineGenerator) Iter() Generator {
+func (l LineGenerator[T]) Iter() Generator[T] {
 	l.file.Seek(0, 0)
-	return LineGenerator{
+	return LineGenerator[T]{
 		file:   l.file,
 		parser: l.parser,
+		mx:     l.mx,
+		reader: bufio.NewReader(l.file),
 	}
 }
 
-type LineParser func(line []byte) interface{}
+type LineParser[T any] func(line []byte) T
 
-type Step func() interface{}
+type Step[T any] func() T
 
-type StepGenerator struct {
+type StepGenerator[T any] struct {
 	current int
-	steps   []Step
+	steps   []Step[T]
 }
 
-func (s StepGenerator) Next() (interface{}, bool) {
+func (s StepGenerator[T]) Next() (T, bool) {
 	if s.current >= len(s.steps)-1 {
-		return nil, false
+		var t T
+		return t, false
 	}
-	return s.steps[s.current], true
+	return s.steps[s.current](), true
 }
 
-func (s StepGenerator) Iter() Generator {
-	return StepGenerator{
+func (s StepGenerator[T]) Iter() Generator[T] {
+	return StepGenerator[T]{
 		current: 0,
 		steps:   s.steps,
 	}
 }
 
-func (sg StepGenerator) Add(s Step) StepGenerator {
-	return StepGenerator{
+func (sg StepGenerator[T]) Add(s Step[T]) StepGenerator[T] {
+	return StepGenerator[T]{
 		current: sg.current,
 		steps:   append(sg.steps, s),
 	}
 }
 
-func ConsumeGenerator(g Generator) []interface{} {
-	vals := []interface{}{}
+func ConsumeGenerator[T any](g Generator[T]) []T {
+	vals := []T{}
 
 	for {
 		val, done := g.Next()
@@ -87,13 +101,11 @@ func ConsumeGenerator(g Generator) []interface{} {
 	}
 	return vals
 }
-func ConsumeUntil(n int, g Generator) []interface{} {
-	vals := []interface{}{}
 
-	for {
-		if n <= 0 {
-			break
-		}
+func ConsumeUntil[T any](g Generator[T], n int) []T {
+	vals := []T{}
+
+	for n > 0 {
 		val, done := g.Next()
 		if done {
 			break
@@ -104,14 +116,33 @@ func ConsumeUntil(n int, g Generator) []interface{} {
 	return vals
 }
 
-type RoundRobinChainGenerator struct {
+type InfiniteGenerator[T any] struct {
+	generator Generator[T]
+}
+
+func (i InfiniteGenerator[T]) Next() (T, bool) {
+	next, b := i.generator.Next()
+	if !b {
+		i.generator = i.generator.Iter()
+		return i.generator.Next()
+	}
+	return next, true
+}
+
+func (i InfiniteGenerator[T]) Iter() Generator[T] {
+	return InfiniteGenerator[T]{
+		generator: i.generator.Iter(),
+	}
+}
+
+type RoundRobinChainGenerator[T any] struct {
 	current       int
-	generators    []Generator
+	generators    []Generator[T]
 	limit         int
 	originalLimit int
 }
 
-func (c RoundRobinChainGenerator) Next() (interface{}, bool) {
+func (c RoundRobinChainGenerator[T]) Next() (T, bool) {
 	generator := c.generators[c.current]
 
 	nextVal, ok := generator.Next()
@@ -127,8 +158,8 @@ func (c RoundRobinChainGenerator) Next() (interface{}, bool) {
 	return nextVal, c.limit >= 0
 }
 
-func (c RoundRobinChainGenerator) Iter() Generator {
-	return RoundRobinChainGenerator{
+func (c RoundRobinChainGenerator[T]) Iter() Generator[T] {
+	return RoundRobinChainGenerator[T]{
 		current:       c.current,
 		generators:    c.generators,
 		limit:         c.originalLimit,
@@ -136,13 +167,13 @@ func (c RoundRobinChainGenerator) Iter() Generator {
 	}
 }
 
-type RandomChainGenerator struct {
-	generators    []Generator
+type RandomChainGenerator[T any] struct {
+	generators    []Generator[T]
 	limit         int
 	originalLimit int
 }
 
-func (c RandomChainGenerator) Next() (interface{}, bool) {
+func (c RandomChainGenerator[T]) Next() (T, bool) {
 	current := rand.Int() % len(c.generators)
 	generator := c.generators[current]
 
@@ -157,26 +188,32 @@ func (c RandomChainGenerator) Next() (interface{}, bool) {
 	return nextVal, c.limit >= 0
 }
 
-func (c RandomChainGenerator) Iter() Generator {
-	return RandomChainGenerator{
+func (c RandomChainGenerator[T]) Iter() Generator[T] {
+	return RandomChainGenerator[T]{
 		generators:    c.generators,
 		limit:         c.originalLimit,
 		originalLimit: c.originalLimit,
 	}
 }
 
-func ChainRoundRobin(limit int, g ...Generator) Generator {
-	return RoundRobinChainGenerator{
+func ChainRoundRobin[T any](limit int, g ...Generator[T]) Generator[T] {
+	return RoundRobinChainGenerator[T]{
 		current:       0,
 		generators:    g,
 		limit:         limit,
 		originalLimit: limit,
 	}
 }
-func ChainRandom(limit int, g ...Generator) Generator {
-	return RandomChainGenerator{
+func ChainRandom[T any](limit int, g ...Generator[T]) Generator[T] {
+	return RandomChainGenerator[T]{
 		generators:    g,
 		limit:         limit,
 		originalLimit: limit,
+	}
+}
+
+func Infinite[T any](g Generator[T]) Generator[T] {
+	return InfiniteGenerator[T]{
+		generator: g,
 	}
 }
